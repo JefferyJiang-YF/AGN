@@ -6,21 +6,24 @@
 import os
 import re
 import json
+import random
 import pickle
 from collections import defaultdict
 
-seed_value = int(os.getenv('RANDOM_SEED', -1))
-if seed_value != -1:
-    import random
-    random.seed(seed_value)
-    import numpy as np
-    np.random.seed(seed_value)
-    import tensorflow as tf
-    tf.set_random_seed(seed_value)
-
-from keras.preprocessing.sequence import pad_sequences
+import numpy as np
+import tensorflow as tf
+from sklearn.feature_extraction.text import TfidfVectorizer
+from langml.utils import pad_sequences
 
 from model import VariationalAutoencoder, Autoencoder
+
+
+# set random seed
+seed_value = int(os.getenv('RANDOM_SEED', -1))
+if seed_value != -1:
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    tf.random.set_seed(seed_value)
 
 
 def clean_str(string):
@@ -46,9 +49,8 @@ def clean_str(string):
 
 
 class DataGenerator:
-    def __init__(self, batch_size, max_len):
+    def __init__(self, batch_size):
         self.batch_size = batch_size
-        self.max_len = max_len
 
     def set_dataset(self, train_set):
         self.train_set = train_set
@@ -62,20 +64,20 @@ class DataGenerator:
             idxs = list(range(self.train_size))
             if shuffle:
                 np.random.shuffle(idxs)
-            batch_token_ids, batch_segment_ids, batch_tcol_ids, batch_label_ids = [], [], [], []
+            batch_token_ids, batch_segment_ids, batch_tfidf, batch_label_ids = [], [], [], []
             for idx in idxs:
                 d = self.train_set[idx]
                 batch_token_ids.append(d['token_ids'])
                 batch_segment_ids.append(d['segment_ids'])
-                batch_tcol_ids.append(d['tcol_ids'])
+                batch_tfidf.append(d['tfidf_vector'])
                 batch_label_ids.append(d['label_id'])
                 if len(batch_token_ids) == self.batch_size or idx == idxs[-1]:
-                    batch_token_ids = pad_sequences(batch_token_ids, maxlen=self.max_len, padding='post', truncating='post')
-                    batch_segment_ids = pad_sequences(batch_segment_ids, maxlen=self.max_len, padding='post', truncating='post')
-                    batch_tcol_ids = np.array(batch_tcol_ids)
+                    batch_token_ids = pad_sequences(batch_token_ids, padding='post', truncating='post')
+                    batch_segment_ids = pad_sequences(batch_segment_ids, padding='post', truncating='post')
+                    batch_tfidf = np.array(batch_tfidf)
                     batch_label_ids = np.array(batch_label_ids)
-                    yield [batch_token_ids, batch_segment_ids, batch_tcol_ids], batch_label_ids
-                    batch_token_ids, batch_segment_ids, batch_tcol_ids, batch_label_ids = [], [], [], []
+                    yield [batch_token_ids, batch_segment_ids, batch_tfidf], batch_label_ids
+                    batch_token_ids, batch_segment_ids, batch_tfidf, batch_label_ids = [], [], [], []
 
     @property
     def steps_per_epoch(self):
@@ -83,43 +85,38 @@ class DataGenerator:
 
 
 class DataLoader:
-    def __init__(self, tokenizer, max_len, use_vae=False, batch_size=64, ae_epochs=20):
+    def __init__(self, tokenizer, ae_latent_dim=128, use_vae=False, batch_size=64, ae_epochs=20):
         self._train_set = []
         self._dev_set = []
         self._test_set = []
 
         self.use_vae = use_vae
         self.batch_size = batch_size
-        self.ae_latent_dim = max_len  # latent dim equal to max len
+        self.ae_latent_dim = ae_latent_dim
         self.ae_epochs = ae_epochs
         self.train_steps = 0
-        self.max_len = max_len
         self.tokenizer = tokenizer
-        self.tcol_info = defaultdict(dict)
-        self.tcol = {}
         self.label2idx = {}
-        self.token2cnt = defaultdict(int)
 
         self.pad = '<pad>'
         self.unk = '<unk>'
+        self.tfidf = TfidfVectorizer(stop_words='english', min_df=3, max_features=5000)
         self.autoencoder = None
 
     def init_autoencoder(self):
         if self.autoencoder is None:
             if self.use_vae:
+                print('>>> self.ae_latent_dim:', self.ae_latent_dim)
                 self.autoencoder = VariationalAutoencoder(
                     latent_dim=self.ae_latent_dim, epochs=self.ae_epochs, batch_size=self.batch_size)
             else:
                 self.autoencoder = Autoencoder(latent_dim=self.ae_latent_dim, epochs=self.ae_epochs, batch_size=self.batch_size)
-            self.autoencoder._compile(self.label_size * self.max_len)
+            self.autoencoder._compile(len(self.tfidf.vocabulary_))
 
     def save_vocab(self, save_path):
         with open(save_path, 'wb') as writer:
             pickle.dump({
-                'tcol_info': self.tcol_info,
-                'tcol': self.tcol,
                 'label2idx': self.label2idx,
-                'token2cnt': self.token2cnt
             }, writer)
 
     def load_vocab(self, save_path):
@@ -190,76 +187,51 @@ class DataLoader:
         elif setname == 'test':
             self._test_set = dataset
 
-    def add_tcol_info(self, token, label):
-        """ add TCoL
-        """
-        if label not in self.tcol_info[token]:
-            self.tcol_info[token][label] = 1
-        else:
-            self.tcol_info[token][label] += 1
-
-    def set_tcol(self):
-        """ set TCoL
-        """
-        self.tcol[0] = np.array([0] * self.label_size)  # pad
-        self.tcol[1] = np.array([0] * self.label_size)  # unk
-        self.tcol[0] = np.reshape(self.tcol[0], (1, -1))
-        self.tcol[1] = np.reshape(self.tcol[1], (1, -1))
-        for token, label_dict in self.tcol_info.items():
-            vector = [0] * self.label_size
-            for label_id, cnt in label_dict.items():
-                vector[label_id] = cnt / self.token2cnt[token]
-            vector = np.array(vector)
-            self.tcol[token] = np.reshape(vector, (1, -1))
-
-    def parse_tcol_ids(self, data, build_vocab=False):
+    def prepare_tfidf(self, data, is_train=False):
         if self.use_vae:
             print("batch alignment...")
             print("previous data size:", len(data))
             keep_size = len(data) // self.batch_size
             data = data[:keep_size * self.batch_size]
             print("alignment data size:", len(data))
-        if build_vocab:
-            print("set tcol....")
-            self.set_tcol()
-            print("token size:", len(self.tcol))
-            print("done to set tcol...")
-        tcol_vectors = []
-        for obj in data:
-            padded = [0] * (self.max_len - len(obj['token_ids']))
-            token_ids = obj['token_ids'] + padded
-            tcol_vector = np.concatenate([self.tcol.get(token, self.tcol[1]) for token in token_ids[:self.max_len]])
-            tcol_vector = np.reshape(tcol_vector, (1, -1))
-            tcol_vectors.append(tcol_vector)
-        print("train vae...")
-        if len(tcol_vectors) > 1:
-            X = np.concatenate(tcol_vectors)
-        else:
-            X = tcol_vectors[0]
-        if build_vocab:
+        X = self.tfidf.transform([obj['raw_text'] for obj in data]).todense()
+        print('>>>tf idf vector shape:', X.shape)
+        if is_train:
             self.init_autoencoder()
             self.autoencoder.fit(X)
         X = self.autoencoder.encoder.predict(X, batch_size=self.batch_size)
+        print('>>> Final X shape:', X.shape)
         # decomposite
         assert len(X) == len(data)
         for x, obj in zip(X, data):
-            obj['tcol_ids'] = x.tolist()
+            obj['tfidf_vector'] = x.tolist()
         return data
 
     def _read_data(self, fpath, build_vocab=False):
         data = []
+        tfidf_corpus = []
         with open(fpath, "r", encoding="utf-8") as reader:
             for line in reader:
                 obj = json.loads(line)
                 obj['text'] = clean_str(obj['text'])
+                tfidf_corpus.append(obj['text'])
                 if build_vocab:
                     if obj['label'] not in self.label2idx:
                         self.label2idx[obj['label']] = len(self.label2idx)
                 tokenized = self.tokenizer.encode(obj['text'])
                 token_ids, segment_ids = tokenized.ids, tokenized.segment_ids
-                for token in token_ids:
-                    self.token2cnt[token] += 1
-                    self.add_tcol_info(token, self.label2idx[obj['label']])
-                data.append({'token_ids': token_ids, 'segment_ids': segment_ids, 'label_id': self.label2idx[obj['label']]})
-            data = self.parse_tcol_ids(data, build_vocab=build_vocab)
+                data.append({
+                    'raw_text': obj['text'],
+                    'token_ids': token_ids,
+                    'segment_ids': segment_ids,
+                    'label_id': self.label2idx[obj['label']]
+                })
+
+        # fit tf-idf
+        
+        if build_vocab:
+            print('fit tfidf...')
+            self.tfidf.fit(tfidf_corpus)
+        print('start to prepare tfidf feature')
+        data = self.prepare_tfidf(data, is_train=build_vocab)
         return data
